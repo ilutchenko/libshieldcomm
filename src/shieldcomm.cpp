@@ -1,5 +1,3 @@
-// shieldcomm.cpp (final)
-
 #include "shieldcomm/shieldcomm.hpp"
 #include "uart_protocol.h"
 
@@ -10,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <chrono>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -114,8 +113,24 @@ struct ShieldComm::Impl {
     std::mutex tx_mtx;
 
     SasCallback sas_cb;
+    SasReplyCallback sas_reply_cb;
     DebugCallback debug_cb;
     ServiceCallback service_cb;
+
+    struct PendingReq {
+        enum class Kind : uint8_t { None = 0, HostGP, HostR, HostSMG };
+
+        Kind kind = Kind::None;
+        uint8_t addr = 0;  // 7-bit SAS addr as sent (without wakeup bit)
+        uint8_t cmd  = 0;  // SAS command (for R/SMG)
+        uint64_t seq = 0;
+        std::chrono::steady_clock::time_point ts{};
+    };
+
+    std::mutex pending_mtx;
+    PendingReq pending;
+    uint64_t pending_seq = 0;
+
 
     ubx_parser_t parser{};
     std::vector<ubx_dispatch_t> dispatch;
@@ -125,6 +140,92 @@ struct ShieldComm::Impl {
         bool ok;
         std::string* err;
     };
+
+    void set_pending(PendingReq::Kind kind, uint8_t addr, uint8_t cmd) {
+        std::lock_guard<std::mutex> lk(pending_mtx);
+        pending.kind = kind;
+        pending.addr = static_cast<uint8_t>(addr & 0x7Fu);
+        pending.cmd  = cmd;
+        pending.seq  = ++pending_seq;
+        pending.ts   = std::chrono::steady_clock::now();
+    }
+
+    void clear_pending(uint64_t seq) {
+        std::lock_guard<std::mutex> lk(pending_mtx);
+        if (pending.kind != PendingReq::Kind::None && pending.seq == seq) {
+            pending = PendingReq{};
+        }
+    }
+
+    bool match_pending_and_get_seq(const SasEvent& ev, uint64_t* out_seq) {
+        PendingReq p;
+        {
+            std::lock_guard<std::mutex> lk(pending_mtx);
+            p = pending;
+        }
+        if (p.kind == PendingReq::Kind::None) return false;
+
+        // Simple “freshness” guard (optional, but useful to avoid matching stale pending)
+        // Keep it small: typical SAS reply is fast; adjust if needed.
+        auto age = std::chrono::steady_clock::now() - p.ts;
+        if (age > std::chrono::seconds(2)) return false;
+
+        auto addr_from_payload0 = [&]() -> uint8_t {
+            if (ev.payload.empty()) return 0xFF;
+            return static_cast<uint8_t>(ev.payload[0] & 0x7Fu);
+        };
+
+        bool ok = false;
+
+        switch (p.kind) {
+            case PendingReq::Kind::HostR: {
+                // Primary expected: EGM_RESP with matching cmd (=ubx_id) and matching addr in payload[0]
+                if (ev.type == SasEventType::SAS_EVT_EGM_RESP &&
+                    ev.ubx_id == p.cmd &&
+                    addr_from_payload0() == p.addr) {
+                    ok = true;
+                }
+
+                // Optional: some firmwares may answer NACK/ACK/BUSY at addr level
+                if (!ok && (ev.type == SasEventType::SAS_EVT_ACK ||
+                            ev.type == SasEventType::SAS_EVT_NACK ||
+                            ev.type == SasEventType::SAS_EVT_BUSY)) {
+                    if (addr_from_payload0() == p.addr) ok = true;
+                }
+            } break;
+
+            case PendingReq::Kind::HostSMG: {
+                // If response carries data: EGM_RESP cmd matches
+                if (ev.type == SasEventType::SAS_EVT_EGM_RESP &&
+                    ev.ubx_id == p.cmd &&
+                    addr_from_payload0() == p.addr) {
+                    ok = true;
+                }
+                // If response is just ACK/NACK/BUSY: match addr
+                if (!ok && (ev.type == SasEventType::SAS_EVT_ACK ||
+                            ev.type == SasEventType::SAS_EVT_NACK ||
+                            ev.type == SasEventType::SAS_EVT_BUSY)) {
+                    if (addr_from_payload0() == p.addr) ok = true;
+                }
+            } break;
+
+            case PendingReq::Kind::HostGP: {
+                // General poll response can be “GP exception” or “EGM event” (RTE 0xFF…) depending on mode.
+                if (ev.type == SasEventType::SAS_EVT_GP_EXCEPTION ||
+                    ev.type == SasEventType::SAS_EVT_EGM_EVENT) {
+                    ok = true;
+                }
+                // Также иногда можно ловить BAD_CRC/FRAME_ERR как “ответ” на send,
+                // но это обычно не то, что хочет пользователь.
+            } break;
+
+            default: break;
+        }
+
+        if (!ok) return false;
+        if (out_seq) *out_seq = p.seq;
+        return true;
+    }
 
     static void ubx_write_all(const uint8_t* data, size_t len, void* user) {
         auto* ctx = static_cast<TxCtx*>(user);
@@ -209,18 +310,32 @@ struct ShieldComm::Impl {
                             void* user) {
         auto* self = static_cast<Impl*>(user);
 
-        SasCallback cb = self->sas_cb;
-        if (!cb) return;
-
         SasEvent ev{};
         ev.type = ubx_cls_to_sas_evt(cls);
         ev.ubx_id = id;
-
         if (payload && payload_len) {
             ev.payload.assign(payload, payload + payload_len);
         }
-        cb(ev);
+
+        // 1) “raw stream” callback (как сейчас)
+        if (auto cb = self->sas_cb) cb(ev);
+
+        // 2) “reply-only” callback
+        if (auto rcb = self->sas_reply_cb) {
+            uint64_t seq = 0;
+            if (self->match_pending_and_get_seq(ev, &seq)) {
+                rcb(ev);
+
+                // Clear pending on “final” responses; keep pending on BUSY (optional)
+                if (ev.type == SasEventType::SAS_EVT_BUSY) {
+                    // keep pending
+                } else {
+                    self->clear_pending(seq);
+                }
+            }
+        }
     }
+
 
     void build_dispatch() {
         dispatch.clear();
@@ -407,6 +522,10 @@ void ShieldComm::set_sas_callback(SasCallback cb) {
     p_->sas_cb = std::move(cb);
 }
 
+void ShieldComm::set_sas_reply_callback(SasReplyCallback cb) {
+    p_->sas_reply_cb = std::move(cb);
+}
+
 void ShieldComm::set_debug_callback(DebugCallback cb) {
     p_->debug_cb = std::move(cb);
 }
@@ -421,17 +540,53 @@ void ShieldComm::set_service_callback(ServiceCallback cb) {
 
 Status ShieldComm::send_host_general_poll(uint8_t addr_with_wakeup, std::string* err) {
     uint8_t b = addr_with_wakeup;
-    return p_->send_ubx_data(UBX_DATA_CLASS_HOST_GENERAL_POLL, &b, 1, UBX_DATA_ID_RAW, err);
+
+    // NEW: pending request (addr without wakeup bit)
+    p_->set_pending(Impl::PendingReq::Kind::HostGP, static_cast<uint8_t>(addr_with_wakeup & 0x7Fu), 0);
+
+    Status st = p_->send_ubx_data(UBX_DATA_CLASS_HOST_GENERAL_POLL, &b, 1, UBX_DATA_ID_RAW, err);
+    if (st != Status::Ok) {
+        // clear only if this pending is still ours (best-effort)
+        // simplest: just clear unconditionally
+        std::lock_guard<std::mutex> lk(p_->pending_mtx);
+        p_->pending = Impl::PendingReq{};
+    }
+    return st;
 }
 
 Status ShieldComm::send_host_poll_r(uint8_t addr, uint8_t cmd, std::string* err) {
     uint8_t fr[2] = { addr, cmd };
-    return p_->send_ubx_data(UBX_DATA_CLASS_HOST_POLL_R, fr, sizeof(fr), cmd, err);
+
+    // NEW pending
+    p_->set_pending(Impl::PendingReq::Kind::HostR, addr, cmd);
+
+    Status st = p_->send_ubx_data(UBX_DATA_CLASS_HOST_POLL_R, fr, sizeof(fr), cmd, err);
+    if (st != Status::Ok) {
+        std::lock_guard<std::mutex> lk(p_->pending_mtx);
+        p_->pending = Impl::PendingReq{};
+    }
+    return st;
 }
 
 Status ShieldComm::send_host_poll_smg(const uint8_t* frame, size_t len, std::string* err) {
-    return p_->send_ubx_data(UBX_DATA_CLASS_HOST_POLL_SMG, frame, len, ubx_id_from_frame(frame, len), err);
+    uint8_t addr = 0;
+    uint8_t cmd  = 0;
+    if (frame && len >= 2) {
+        addr = frame[0];
+        cmd  = frame[1];
+    }
+
+    // NEW pending
+    p_->set_pending(Impl::PendingReq::Kind::HostSMG, addr, cmd);
+
+    Status st = p_->send_ubx_data(UBX_DATA_CLASS_HOST_POLL_SMG, frame, len, ubx_id_from_frame(frame, len), err);
+    if (st != Status::Ok) {
+        std::lock_guard<std::mutex> lk(p_->pending_mtx);
+        p_->pending = Impl::PendingReq{};
+    }
+    return st;
 }
+
 
 // EGM -> Host (simulation/injection/testing)
 

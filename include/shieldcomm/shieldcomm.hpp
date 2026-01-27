@@ -56,6 +56,7 @@ public:
     using SasCallback = std::function<void(const SasEvent&)>;
     using DebugCallback = std::function<void(const std::string&)>;
     using ServiceCallback = std::function<void(const ServiceEvent&)>;
+    using SasReplyCallback = std::function<void(const SasEvent&)>;
 
     ShieldComm();
     ~ShieldComm();
@@ -70,6 +71,7 @@ public:
     void set_sas_callback(SasCallback cb);
     void set_debug_callback(DebugCallback cb);
     void set_service_callback(ServiceCallback cb);
+    void set_sas_reply_callback(SasReplyCallback cb);
 
     // ---------- TX: one function per SAS event ----------
     // Host -> EGM
