@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <sys/types.h>
 #include <variant>
 #include <vector>
 
@@ -101,6 +102,26 @@ public:
 
     // Service
     Status send_service(ServiceCommand cmd, std::string* err = nullptr);
+
+    // ---------- FD API (virtual serial port) ----------
+    // Creates a bidirectional AF_UNIX SOCK_SEQPACKET socketpair.
+    // The returned fd is poll/select-able.
+    //
+    // Contract:
+    //   - app write(fd, frame, len): len must be exactly one SAS frame:
+    //       * len==1  -> Host general poll (addr|wakeup)
+    //       * len==2  -> Host poll R (addr, cmd)
+    //       * len>=3  -> Host poll SMG (addr, cmd, ...)
+    //   - app read(fd, ...): returns exactly one SAS frame produced by firmware
+    //     (payloads of SAS_EVT_* events; ACK/NACK/BUSY/etc are delivered as their payloads).
+    //
+    Status enable_fd_api(std::string* err = nullptr);
+    void disable_fd_api();
+    int get_fd() const;   // application side fd, or -1 if disabled
+
+    // Optional convenience wrappers (so caller doesn't include unistd.h if they don't want)
+    ssize_t fd_read(void* buf, size_t len);
+    ssize_t fd_write(const void* buf, size_t len);
 
 private:
     struct Impl;

@@ -12,6 +12,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -106,6 +107,7 @@ static SasEventType ubx_cls_to_sas_evt(uint8_t cls) {
 struct ShieldComm::Impl {
     int fd = -1;
     Options opt{};
+    ShieldComm* owner = nullptr;
 
     std::atomic<bool> running{false};
     std::thread rx_thread;
@@ -116,6 +118,12 @@ struct ShieldComm::Impl {
     SasReplyCallback sas_reply_cb;
     DebugCallback debug_cb;
     ServiceCallback service_cb;
+
+    // ----- FD API -----
+    int app_fd = -1;   // returned to application
+    int lib_fd = -1;   // owned by library
+    std::atomic<bool> fd_running{false};
+    std::thread fd_thread;
 
     struct PendingReq {
         enum class Kind : uint8_t { None = 0, HostGP, HostR, HostSMG };
@@ -140,6 +148,67 @@ struct ShieldComm::Impl {
         bool ok;
         std::string* err;
     };
+
+    void fd_loop() {
+        std::vector<uint8_t> buf(UBX_MAX_PAYLOAD);
+
+        while (fd_running.load(std::memory_order_relaxed)) {
+            pollfd pfd{};
+            pfd.fd = lib_fd;
+            pfd.events = POLLIN;
+
+            int pr = ::poll(&pfd, 1, 200);
+            if (!fd_running.load(std::memory_order_relaxed)) break;
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) continue;
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+
+            if (pfd.revents & POLLIN) {
+                // One recv = one packet = one SAS frame (SEQPACKET preserves boundaries)
+                ssize_t n = ::recv(lib_fd, buf.data(), buf.size(), 0);
+                if (n < 0) {
+                    if (errno == EINTR || errno == EAGAIN) continue;
+                    break;
+                }
+                if (n == 0) break;
+
+                size_t len = static_cast<size_t>(n);
+                const uint8_t* frame = buf.data();
+
+                // Map "classic serial write" to UBX TX.
+                // Treat each packet as a complete SAS frame.
+                std::string err;
+                if (owner) {
+                    if (len == 1) {
+                        (void)owner->send_host_general_poll(frame[0], &err);
+                    } else if (len == 2) {
+                        (void)owner->send_host_poll_r(frame[0], frame[1], &err);
+                    } else {
+                        (void)owner->send_host_poll_smg(frame, len, &err);
+                    }
+                } else {
+                    err = "owner not set";
+                }
+
+                // Non-fatal error reporting
+                if (!err.empty()) {
+                    if (auto cb = debug_cb) cb(std::string("[fd_api] tx error: ") + err);
+                }
+            }
+        }
+    }
+
+    void fd_api_write_to_app(const uint8_t* data, size_t len) {
+        if (lib_fd < 0) return;
+        if (!data || len == 0) return;
+
+        // Best-effort nonblocking send.
+        // If app doesn't read fast enough, packets may be dropped.
+        (void)::send(lib_fd, data, len, MSG_DONTWAIT);
+    }
 
     void set_pending(PendingReq::Kind kind, uint8_t addr, uint8_t cmd) {
         std::lock_guard<std::mutex> lk(pending_mtx);
@@ -321,19 +390,23 @@ struct ShieldComm::Impl {
         if (auto cb = self->sas_cb) cb(ev);
 
         // 2) “reply-only” callback
-        if (auto rcb = self->sas_reply_cb) {
-            uint64_t seq = 0;
-            if (self->match_pending_and_get_seq(ev, &seq)) {
+        
+        uint64_t seq = 0;
+        if (self->match_pending_and_get_seq(ev, &seq)) {
+            if (auto rcb = self->sas_reply_cb) {
                 rcb(ev);
-
-                // Clear pending on “final” responses; keep pending on BUSY (optional)
-                if (ev.type == SasEventType::SAS_EVT_BUSY) {
-                    // keep pending
-                } else {
-                    self->clear_pending(seq);
-                }
             }
+            self->fd_api_write_to_app(ev.payload.data(), ev.payload.size());
+            // Clear pending on “final” responses; keep pending on BUSY (optional)
+            if (ev.type == SasEventType::SAS_EVT_BUSY) {
+                // keep pending
+            } else {
+                self->clear_pending(seq);
+            }
+        
         }
+
+        // 3) FD API stream (legacy read())
     }
 
 
@@ -464,7 +537,9 @@ struct ShieldComm::Impl {
     }
 };
 
-ShieldComm::ShieldComm() : p_(new Impl) {}
+ShieldComm::ShieldComm() : p_(new Impl) {
+    p_->owner = this;
+}
 ShieldComm::~ShieldComm() {
     close();
     delete p_;
@@ -503,6 +578,8 @@ bool ShieldComm::open(const Options& opt, std::string* err) {
 void ShieldComm::close() {
     if (!is_open()) return;
 
+    disable_fd_api();
+
     p_->running.store(false, std::memory_order_relaxed);
 
     int fd = p_->fd;
@@ -532,6 +609,75 @@ void ShieldComm::set_debug_callback(DebugCallback cb) {
 
 void ShieldComm::set_service_callback(ServiceCallback cb) {
     p_->service_cb = std::move(cb);
+}
+
+Status ShieldComm::enable_fd_api(std::string* err) {
+    if (!is_open()) {
+        if (err) *err = "Port not open";
+        return Status::NotOpen;
+    }
+    if (p_->app_fd >= 0 || p_->lib_fd >= 0) {
+        if (err) *err = "FD API already enabled";
+        return Status::InvalidArg;
+    }
+
+    int sv[2] = {-1, -1};
+    // SEQPACKET preserves write boundaries
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) != 0) {
+        if (err) *err = std::string("socketpair failed: ") + std::strerror(errno);
+        return Status::IoError;
+    }
+
+    // Make both ends nonblocking (optional but recommended)
+    for (int i = 0; i < 2; ++i) {
+        int fl = ::fcntl(sv[i], F_GETFL, 0);
+        if (fl >= 0) (void)::fcntl(sv[i], F_SETFL, fl | O_NONBLOCK);
+    }
+
+    p_->app_fd = sv[0];
+    p_->lib_fd = sv[1];
+
+    p_->fd_running.store(true, std::memory_order_relaxed);
+    p_->fd_thread = std::thread([this]() { p_->fd_loop(); });
+
+    return Status::Ok;
+}
+
+void ShieldComm::disable_fd_api() {
+    if (!p_) return;
+
+    p_->fd_running.store(false, std::memory_order_relaxed);
+
+    int a = p_->app_fd;
+    int b = p_->lib_fd;
+    p_->app_fd = -1;
+    p_->lib_fd = -1;
+
+    if (a >= 0) ::close(a);
+    if (b >= 0) ::close(b);
+
+    if (p_->fd_thread.joinable()) p_->fd_thread.join();
+}
+
+int ShieldComm::get_fd() const {
+    if (!p_) return -1;
+    return p_->app_fd;
+}
+
+ssize_t ShieldComm::fd_read(void* buf, size_t len) {
+    if (!p_ || p_->app_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    return ::read(p_->app_fd, buf, len);
+}
+
+ssize_t ShieldComm::fd_write(const void* buf, size_t len) {
+    if (!p_ || p_->app_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    return ::write(p_->app_fd, buf, len);
 }
 
 // ---------------- TX: one function per SAS event ----------------
