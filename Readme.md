@@ -221,6 +221,39 @@ void set_service_callback(ServiceCallback cb);
 
 ---
 
+## FD API (виртуальный сериал)
+
+FD API позволяет общаться с библиотекой через file descriptor (как с обычным портом),
+но внутри используется `socketpair(AF_UNIX, SOCK_SEQPACKET)`, поэтому **границы пакетов сохраняются**.
+Один `write()` == один SAS-фрейм, один `read()` == один SAS-фрейм.
+
+```cpp
+Status enable_fd_api(std::string* err = nullptr);
+void disable_fd_api();
+int get_fd() const; // fd приложения, или -1 если API выключен
+
+ssize_t fd_read(void* buf, size_t len);
+ssize_t fd_write(const void* buf, size_t len);
+```
+
+Контракт записи (TX):
+
+* `len == 1` → Host General Poll (`[addr|wakeup]`)
+* `len == 2` → Host Poll R (`[addr, cmd]`)
+* `len >= 3` → Host Poll SMG (`[addr, cmd, ...]`)
+
+Контракт чтения (RX):
+
+* `read()` возвращает **ровно один** SAS-фрейм, как он пришёл от прошивки.
+* Для ACK/NACK/BUSY/CHIRP/GP_EXCEPTION вернётся их payload (например, `[addr]` или `[addr, 0x80|addr]`).
+
+Примечания:
+
+* fd делается non-blocking, поэтому `read()` может вернуть `-1` с `EAGAIN`.
+* если приложение не успевает читать, часть пакетов может быть отброшена (best-effort).
+
+---
+
 ## Отправка (TX): функции “one function per SAS event”
 
 Все TX-методы возвращают `Status` и могут заполнить `err`.
@@ -400,6 +433,31 @@ sc.set_sas_callback([](const shieldcomm::SasEvent& ev) {
   std::fprintf(stderr, "[%s] id=0x%02X len=%zu\n",
                type_to_str(ev.type), ev.ubx_id, ev.payload.size());
 });
+```
+
+### Пример 4: Чтение через `fd_read()` (FD API)
+
+```cpp
+shieldcomm::ShieldComm sc;
+std::string err;
+
+shieldcomm::Options opt{"/dev/ttyAMA3", 115200};
+if (!sc.open(opt, &err)) { /* обработать */ }
+
+if (sc.enable_fd_api(&err) != shieldcomm::Status::Ok) { /* обработать */ }
+
+// Отправим R-полл через fd API (addr, cmd)
+uint8_t rpoll[2] = {0x01, 0x54};
+if (sc.fd_write(rpoll, sizeof(rpoll)) < 0) { /* обработать */ }
+
+// Прочитаем один фрейм ответа
+uint8_t buf[256];
+ssize_t n = sc.fd_read(buf, sizeof(buf));
+if (n > 0) {
+  // buf[0..n-1] — SAS-фрейм (как пришёл)
+} else {
+  // n < 0: errno (EAGAIN, EBADF, ...)
+}
 ```
 
 ---
