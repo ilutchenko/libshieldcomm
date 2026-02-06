@@ -149,6 +149,11 @@ struct ShieldComm::Impl {
         std::string* err;
     };
 
+    Status send_service_payload(ServiceCommand cmd,
+                                const uint8_t* data,
+                                size_t len,
+                                std::string* err);
+
     void fd_loop() {
         std::vector<uint8_t> buf(UBX_MAX_PAYLOAD);
 
@@ -369,6 +374,15 @@ struct ShieldComm::Impl {
             ServiceFirmwareVersion ev{};
             ev.major = data[0];
             ev.minor = data[1];
+            cb(ev);
+            return;
+        }
+
+        if (cmd == static_cast<uint8_t>(ServiceCommand::SetHostEgmProxy) ||
+            cmd == static_cast<uint8_t>(ServiceCommand::GetHostEgmProxy)) {
+            if (data_len < 1) return;
+            ServiceProxyStatus ev{};
+            ev.enabled = (data[0] != 0);
             cb(ev);
             return;
         }
@@ -773,27 +787,54 @@ Status ShieldComm::send_chirp(uint8_t addr_with_wakeup, std::string* err) {
 }
 
 // Service
-
-Status ShieldComm::send_service(ServiceCommand cmd, std::string* err) {
-    if (!is_open()) {
+Status ShieldComm::Impl::send_service_payload(ServiceCommand cmd,
+                                              const uint8_t* data,
+                                              size_t len,
+                                              std::string* err) {
+    if (fd < 0) {
         if (err) *err = "Port not open";
         return Status::NotOpen;
     }
+    if (!data && len != 0u) {
+        if (err) *err = "Null data with non-zero length";
+        return Status::InvalidArg;
+    }
+    if (len > (UBX_MAX_PAYLOAD - 1u)) {
+        if (err) *err = "Payload too large for UBX_MAX_PAYLOAD";
+        return Status::IoError;
+    }
 
-    uint8_t c = static_cast<uint8_t>(cmd);
+    uint8_t buf[1 + UBX_MAX_PAYLOAD];
+    buf[0] = static_cast<uint8_t>(cmd);
+    if (len && data) {
+        memcpy(&buf[1], data, len);
+    }
 
-    std::lock_guard<std::mutex> lk(p_->tx_mtx);
-    Impl::TxCtx ctx{ .fd = p_->fd, .ok = true, .err = err };
+    std::lock_guard<std::mutex> lk(tx_mtx);
+    TxCtx ctx{ .fd = fd, .ok = true, .err = err };
 
     ubx_status_t st = ubx_send(&Impl::ubx_write_all, &ctx,
                               UBX_APP_CLASS, UBX_APP_ID_SERVICE,
-                              &c, 1);
+                              buf, static_cast<uint16_t>(len + 1u));
     if (st != UBX_OK) {
         if (err && err->empty()) *err = "ubx_send failed";
         return Status::IoError;
     }
     if (!ctx.ok) return Status::IoError;
     return Status::Ok;
+}
+
+Status ShieldComm::send_service(ServiceCommand cmd, std::string* err) {
+    return p_->send_service_payload(cmd, nullptr, 0u, err);
+}
+
+Status ShieldComm::set_host_egm_proxy(bool enabled, std::string* err) {
+    uint8_t v = enabled ? 1u : 0u;
+    return p_->send_service_payload(ServiceCommand::SetHostEgmProxy, &v, 1u, err);
+}
+
+Status ShieldComm::get_host_egm_proxy_status(std::string* err) {
+    return p_->send_service_payload(ServiceCommand::GetHostEgmProxy, nullptr, 0u, err);
 }
 
 } // namespace shieldcomm

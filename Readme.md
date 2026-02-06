@@ -35,6 +35,8 @@ int main() {
         std::cerr << "[SERVICE] serial: " << e.serial << "\n";
       } else if constexpr (std::is_same_v<T, shieldcomm::ServiceFirmwareVersion>) {
         std::cerr << "[SERVICE] fw: " << int(e.major) << "." << int(e.minor) << "\n";
+      } else if constexpr (std::is_same_v<T, shieldcomm::ServiceProxyStatus>) {
+        std::cerr << "[SERVICE] host-egm proxy: " << (e.enabled ? "ON" : "OFF") << "\n";
       }
     }, ev);
   });
@@ -169,6 +171,8 @@ enum class Status {
 enum class ServiceCommand : uint8_t {
     ReadSerial = 0x01,
     ReadFirmwareVersion = 0x02,
+    SetHostEgmProxy = 0x03,
+    GetHostEgmProxy = 0x04,
 };
 ```
 
@@ -177,7 +181,8 @@ enum class ServiceCommand : uint8_t {
 ```cpp
 struct ServiceSerial { std::string serial; };
 struct ServiceFirmwareVersion { uint8_t major = 0, minor = 0; };
-using ServiceEvent = std::variant<ServiceSerial, ServiceFirmwareVersion>;
+struct ServiceProxyStatus { bool enabled = false; };
+using ServiceEvent = std::variant<ServiceSerial, ServiceFirmwareVersion, ServiceProxyStatus>;
 ```
 
 **Контракт**: ответ от прошивки приходит как UBX payload = `[cmd][data...]`.
@@ -409,6 +414,8 @@ sc.set_service_callback([](const shieldcomm::ServiceEvent& ev) {
       std::printf("SERIAL: %s\n", e.serial.c_str());
     if constexpr (std::is_same_v<T, shieldcomm::ServiceFirmwareVersion>)
       std::printf("FW: %u.%u\n", e.major, e.minor);
+    if constexpr (std::is_same_v<T, shieldcomm::ServiceProxyStatus>)
+      std::printf("HOST-EGM PROXY: %s\n", e.enabled ? "ON" : "OFF");
   }, ev);
 });
 

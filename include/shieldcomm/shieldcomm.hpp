@@ -24,6 +24,8 @@ enum class Status {
 enum class ServiceCommand : uint8_t {
     ReadSerial = 0x01,
     ReadFirmwareVersion = 0x02,
+    SetHostEgmProxy = 0x03,
+    GetHostEgmProxy = 0x04,
 };
 
 enum class SasEventType : uint8_t {
@@ -50,7 +52,8 @@ struct SasEvent {
 
 struct ServiceSerial { std::string serial; };
 struct ServiceFirmwareVersion { uint8_t major = 0, minor = 0; };
-using ServiceEvent = std::variant<ServiceSerial, ServiceFirmwareVersion>;
+struct ServiceProxyStatus { bool enabled = false; };
+using ServiceEvent = std::variant<ServiceSerial, ServiceFirmwareVersion, ServiceProxyStatus>;
 
 class ShieldComm {
 public:
@@ -102,6 +105,8 @@ public:
 
     // Service
     Status send_service(ServiceCommand cmd, std::string* err = nullptr);
+    Status set_host_egm_proxy(bool enabled, std::string* err = nullptr);
+    Status get_host_egm_proxy_status(std::string* err = nullptr);
 
     // ---------- FD API (virtual serial port) ----------
     // Creates a bidirectional AF_UNIX SOCK_SEQPACKET socketpair.

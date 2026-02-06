@@ -34,6 +34,8 @@ extern "C" {
 
 #define UBX_SVC_READ_SERIAL          0x01u
 #define UBX_SVC_READ_FIRMWARE_VER    0x02u
+#define UBX_SVC_SET_HOST_EGM_PROXY   0x03u
+#define UBX_SVC_get_host_egm_proxy_status   0x04u
 
 /* Choose a max payload you expect (NAV-PVT is 92 bytes, some can be larger). */
 #ifndef UBX_MAX_PAYLOAD
