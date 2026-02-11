@@ -260,6 +260,12 @@ struct ShieldComm::Impl {
                     ok = true;
                 }
 
+                // In RTE mode, an event response (addr,0xFF,...) can be returned instead of the long-poll response.
+                if (!ok && ev.type == SasEventType::SAS_EVT_EGM_EVENT &&
+                    addr_from_payload0() == p.addr) {
+                    ok = true;
+                }
+
                 // Optional: some firmwares may answer NACK/ACK/BUSY at addr level
                 if (!ok && (ev.type == SasEventType::SAS_EVT_ACK ||
                             ev.type == SasEventType::SAS_EVT_NACK ||
@@ -272,6 +278,11 @@ struct ShieldComm::Impl {
                 // If response carries data: EGM_RESP cmd matches
                 if (ev.type == SasEventType::SAS_EVT_EGM_RESP &&
                     ev.ubx_id == p.cmd &&
+                    addr_from_payload0() == p.addr) {
+                    ok = true;
+                }
+                // In RTE mode, an event response (addr,0xFF,...) can be returned instead of the long-poll response.
+                if (!ok && ev.type == SasEventType::SAS_EVT_EGM_EVENT &&
                     addr_from_payload0() == p.addr) {
                     ok = true;
                 }
