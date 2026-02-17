@@ -255,12 +255,13 @@ struct ShieldComm::Impl {
             case PendingReq::Kind::HostR: {
                 // Primary expected: EGM_RESP with matching cmd (=ubx_id) and matching addr in payload[0]
                 if (ev.type == SasEventType::SAS_EVT_EGM_RESP &&
-                    ev.ubx_id == p.cmd &&
+                    (ev.ubx_id == p.cmd || ev.ubx_id == 0xFFu) &&
                     addr_from_payload0() == p.addr) {
                     ok = true;
                 }
 
                 // In RTE mode, an event response (addr,0xFF,...) can be returned instead of the long-poll response.
+                // Some firmware sends it as EGM_EVENT, others keep EGM_RESP with cmd=0xFF.
                 if (!ok && ev.type == SasEventType::SAS_EVT_EGM_EVENT &&
                     addr_from_payload0() == p.addr) {
                     ok = true;
@@ -277,11 +278,12 @@ struct ShieldComm::Impl {
             case PendingReq::Kind::HostSMG: {
                 // If response carries data: EGM_RESP cmd matches
                 if (ev.type == SasEventType::SAS_EVT_EGM_RESP &&
-                    ev.ubx_id == p.cmd &&
+                    (ev.ubx_id == p.cmd || ev.ubx_id == 0xFFu) &&
                     addr_from_payload0() == p.addr) {
                     ok = true;
                 }
                 // In RTE mode, an event response (addr,0xFF,...) can be returned instead of the long-poll response.
+                // Some firmware sends it as EGM_EVENT, others keep EGM_RESP with cmd=0xFF.
                 if (!ok && ev.type == SasEventType::SAS_EVT_EGM_EVENT &&
                     addr_from_payload0() == p.addr) {
                     ok = true;
