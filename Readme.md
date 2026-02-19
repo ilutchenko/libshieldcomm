@@ -159,6 +159,7 @@ enum class Status {
     Ok = 0,
     NotOpen,
     IoError,
+    Timeout,
     InvalidArg,
 };
 ```
@@ -211,10 +212,12 @@ bool is_open() const;
 
 ```cpp
 using SasCallback = std::function<void(const SasEvent&)>;
+using SasReplyCallback = std::function<void(const SasEvent&)>;
 using DebugCallback = std::function<void(const std::string&)>;
 using ServiceCallback = std::function<void(const ServiceEvent&)>;
 
 void set_sas_callback(SasCallback cb);
+void set_sas_reply_callback(SasReplyCallback cb);
 void set_debug_callback(DebugCallback cb);
 void set_service_callback(ServiceCallback cb);
 ```
@@ -223,6 +226,7 @@ void set_service_callback(ServiceCallback cb);
 
 * callbacks вызываются из RX-потока библиотеки (внутренний `rx_thread`).
 * если внутри callback вы трогаете UI/общие структуры — обеспечьте потокобезопасность (mutex/queue/dispatch в главный поток).
+* `set_sas_reply_callback()` вызывается только для событий, которые матчатся к текущему pending host-запросу.
 
 ---
 
@@ -291,6 +295,45 @@ Status send_host_poll_smg(const std::vector<uint8_t>& frame, std::string* err = 
 
 Payload: `frame[0..len-1]`.
 Если `len >= 2`, то `ubx_id = frame[1]` (как “cmd”), иначе RAW.
+
+### Блокирующие TX-варианты (send + wait)
+
+Для host-запросов доступны блокирующие методы, которые отправляют фрейм и ждут
+соответствующий ответ (или timeout):
+
+```cpp
+Status send_host_general_poll_wait(uint8_t addr_with_wakeup,
+                                   int timeout_ms,
+                                   SasEvent* out_reply,
+                                   std::string* err = nullptr);
+
+Status send_host_poll_r_wait(uint8_t addr,
+                             uint8_t cmd,
+                             int timeout_ms,
+                             SasEvent* out_reply,
+                             std::string* err = nullptr);
+
+Status send_host_poll_smg_wait(const uint8_t* frame,
+                               size_t len,
+                               int timeout_ms,
+                               SasEvent* out_reply,
+                               std::string* err = nullptr);
+Status send_host_poll_smg_wait(const std::vector<uint8_t>& frame,
+                               int timeout_ms,
+                               SasEvent* out_reply,
+                               std::string* err = nullptr);
+```
+
+Контракт:
+
+* `Status` отражает результат отправки/ожидания.
+* `Status::Ok` — получен matched-ответ (в `out_reply`, если указатель не `nullptr`).
+* `Status::Timeout` — timeout ожидания ответа.
+* `Status::InvalidArg`, `Status::NotOpen`, `Status::IoError` — ошибки аргументов/порта/IO.
+* `BUSY` не завершает ожидание: wait продолжается до “финального” ответа или timeout.
+* в один момент времени поддерживается один blocking wait на экземпляр `ShieldComm`.
+* matched-ответ продолжает приходить и в `set_sas_reply_callback()` (если callback установлен).
+* timeout передаётся как `int` в миллисекундах; внутри библиотека конвертирует его в `std::chrono::milliseconds`.
 
 ### EGM → Host (симуляция / инъекция / тесты)
 
@@ -467,6 +510,31 @@ if (n > 0) {
 }
 ```
 
+### Пример 5: Блокирующий `send_host_poll_r_wait()`
+
+```cpp
+shieldcomm::ShieldComm sc;
+std::string err;
+
+shieldcomm::Options opt{"/dev/ttyAMA3", 115200};
+if (!sc.open(opt, &err)) { /* обработать */ }
+
+shieldcomm::SasEvent reply;
+auto st = sc.send_host_poll_r_wait(/*addr*/0x01,
+                                   /*cmd*/0x54,
+                                   200, // timeout_ms
+                                   &reply,
+                                   &err);
+if (st == shieldcomm::Status::Timeout) {
+  // timeout
+} else if (st != shieldcomm::Status::Ok) {
+  // ошибка отправки/IO/порта
+} else {
+  // Получен matched-ответ на 0x54
+  // reply.payload: сырой SAS-фрейм
+}
+```
+
 ---
 
 ## Потокобезопасность и модель исполнения
@@ -476,6 +544,7 @@ if (n > 0) {
 
   * ваши callbacks тоже вызываются из RX-потока, поэтому избегайте блокировать надолго.
 * `close()` останавливает RX-поток, закрывает fd и делает `join()`.
+* host-запросы сериализуются; одновременно допустим только один blocking wait на экземпляр.
 
 Рекомендуемый паттерн для приложений с UI:
 
