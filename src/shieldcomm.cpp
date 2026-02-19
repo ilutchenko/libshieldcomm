@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -113,6 +114,7 @@ struct ShieldComm::Impl {
     std::thread rx_thread;
 
     std::mutex tx_mtx;
+    std::mutex req_mtx;
 
     SasCallback sas_cb;
     SasReplyCallback sas_reply_cb;
@@ -132,12 +134,25 @@ struct ShieldComm::Impl {
         uint8_t addr = 0;  // 7-bit SAS addr as sent (without wakeup bit)
         uint8_t cmd  = 0;  // SAS command (for R/SMG)
         uint64_t seq = 0;
-        std::chrono::steady_clock::time_point ts{};
     };
 
     std::mutex pending_mtx;
     PendingReq pending;
     uint64_t pending_seq = 0;
+
+    std::mutex wait_mtx;
+    std::condition_variable wait_cv;
+    bool wait_active = false;
+    bool wait_done = false;
+    bool wait_closed = false;
+    uint64_t wait_seq = 0;
+    SasEvent wait_event{};
+
+    enum class WaitOutcome : uint8_t {
+        Event = 0,
+        Timeout,
+        Closed,
+    };
 
 
     ubx_parser_t parser{};
@@ -221,7 +236,6 @@ struct ShieldComm::Impl {
         pending.addr = static_cast<uint8_t>(addr & 0x7Fu);
         pending.cmd  = cmd;
         pending.seq  = ++pending_seq;
-        pending.ts   = std::chrono::steady_clock::now();
     }
 
     void clear_pending(uint64_t seq) {
@@ -231,6 +245,79 @@ struct ShieldComm::Impl {
         }
     }
 
+    uint64_t next_pending_seq() {
+        std::lock_guard<std::mutex> lk(pending_mtx);
+        return pending_seq + 1;
+    }
+
+    bool begin_wait(uint64_t seq, std::string* err) {
+        std::lock_guard<std::mutex> lk(wait_mtx);
+        if (wait_active) {
+            if (err) *err = "Another blocking wait is already in progress";
+            return false;
+        }
+        wait_active = true;
+        wait_done = false;
+        wait_closed = false;
+        wait_seq = seq;
+        wait_event = SasEvent{};
+        return true;
+    }
+
+    void complete_wait_if_match(uint64_t seq, const SasEvent& ev) {
+        std::lock_guard<std::mutex> lk(wait_mtx);
+        if (!wait_active || wait_seq != seq) return;
+        if (ev.type == SasEventType::SAS_EVT_BUSY) return;
+        wait_event = ev;
+        wait_done = true;
+        wait_active = false;
+        wait_cv.notify_all();
+    }
+
+    void cancel_wait(uint64_t seq) {
+        std::lock_guard<std::mutex> lk(wait_mtx);
+        if (wait_active && wait_seq == seq) {
+            wait_active = false;
+        }
+        if (wait_seq == seq) {
+            wait_seq = 0;
+        }
+        wait_done = false;
+        wait_closed = false;
+    }
+
+    WaitOutcome wait_for_reply(uint64_t seq, std::chrono::milliseconds timeout, SasEvent* out_reply) {
+        std::unique_lock<std::mutex> lk(wait_mtx);
+        const bool ready = wait_cv.wait_for(lk, timeout, [&] { return wait_done || wait_closed; });
+        if (!ready) {
+            if (wait_active && wait_seq == seq) {
+                wait_active = false;
+                wait_seq = 0;
+            }
+            return WaitOutcome::Timeout;
+        }
+
+        if (wait_closed) {
+            wait_closed = false;
+            wait_done = false;
+            wait_seq = 0;
+            return WaitOutcome::Closed;
+        }
+
+        if (out_reply) *out_reply = wait_event;
+        wait_done = false;
+        wait_seq = 0;
+        return WaitOutcome::Event;
+    }
+
+    void notify_wait_closed() {
+        std::lock_guard<std::mutex> lk(wait_mtx);
+        if (!wait_active) return;
+        wait_closed = true;
+        wait_active = false;
+        wait_cv.notify_all();
+    }
+
     bool match_pending_and_get_seq(const SasEvent& ev, uint64_t* out_seq) {
         PendingReq p;
         {
@@ -238,11 +325,6 @@ struct ShieldComm::Impl {
             p = pending;
         }
         if (p.kind == PendingReq::Kind::None) return false;
-
-        // Simple “freshness” guard (optional, but useful to avoid matching stale pending)
-        // Keep it small: typical SAS reply is fast; adjust if needed.
-        auto age = std::chrono::steady_clock::now() - p.ts;
-        if (age > std::chrono::seconds(2)) return false;
 
         auto addr_from_payload0 = [&]() -> uint8_t {
             if (ev.payload.empty()) return 0xFF;
@@ -420,6 +502,7 @@ struct ShieldComm::Impl {
         
         uint64_t seq = 0;
         if (self->match_pending_and_get_seq(ev, &seq)) {
+            self->complete_wait_if_match(seq, ev);
             if (auto rcb = self->sas_reply_cb) {
                 rcb(ev);
             }
@@ -562,6 +645,23 @@ struct ShieldComm::Impl {
         if (!ctx.ok) return Status::IoError;
         return Status::Ok;
     }
+
+    Status send_host_request_locked(PendingReq::Kind kind,
+                                    uint8_t addr,
+                                    uint8_t cmd,
+                                    uint8_t ubx_cls,
+                                    const uint8_t* payload,
+                                    size_t len,
+                                    uint8_t ubx_id,
+                                    std::string* err) {
+        set_pending(kind, addr, cmd);
+        Status st = send_ubx_data(ubx_cls, payload, len, ubx_id, err);
+        if (st != Status::Ok) {
+            std::lock_guard<std::mutex> lk(pending_mtx);
+            pending = PendingReq{};
+        }
+        return st;
+    }
 };
 
 ShieldComm::ShieldComm() : p_(new Impl) {
@@ -608,6 +708,7 @@ void ShieldComm::close() {
     disable_fd_api();
 
     p_->running.store(false, std::memory_order_relaxed);
+    p_->notify_wait_closed();
 
     int fd = p_->fd;
     p_->fd = -1;
@@ -713,32 +814,28 @@ ssize_t ShieldComm::fd_write(const void* buf, size_t len) {
 
 Status ShieldComm::send_host_general_poll(uint8_t addr_with_wakeup, std::string* err) {
     uint8_t b = addr_with_wakeup;
-
-    // NEW: pending request (addr without wakeup bit)
-    p_->set_pending(Impl::PendingReq::Kind::HostGP, static_cast<uint8_t>(addr_with_wakeup & 0x7Fu), 0);
-
-    Status st = p_->send_ubx_data(UBX_DATA_CLASS_HOST_GENERAL_POLL, &b, 1, UBX_DATA_ID_RAW, err);
-    if (st != Status::Ok) {
-        // clear only if this pending is still ours (best-effort)
-        // simplest: just clear unconditionally
-        std::lock_guard<std::mutex> lk(p_->pending_mtx);
-        p_->pending = Impl::PendingReq{};
-    }
-    return st;
+    std::lock_guard<std::mutex> req_lk(p_->req_mtx);
+    return p_->send_host_request_locked(Impl::PendingReq::Kind::HostGP,
+                                        static_cast<uint8_t>(addr_with_wakeup & 0x7Fu),
+                                        0,
+                                        UBX_DATA_CLASS_HOST_GENERAL_POLL,
+                                        &b,
+                                        1,
+                                        UBX_DATA_ID_RAW,
+                                        err);
 }
 
 Status ShieldComm::send_host_poll_r(uint8_t addr, uint8_t cmd, std::string* err) {
     uint8_t fr[2] = { addr, cmd };
-
-    // NEW pending
-    p_->set_pending(Impl::PendingReq::Kind::HostR, addr, cmd);
-
-    Status st = p_->send_ubx_data(UBX_DATA_CLASS_HOST_POLL_R, fr, sizeof(fr), cmd, err);
-    if (st != Status::Ok) {
-        std::lock_guard<std::mutex> lk(p_->pending_mtx);
-        p_->pending = Impl::PendingReq{};
-    }
-    return st;
+    std::lock_guard<std::mutex> req_lk(p_->req_mtx);
+    return p_->send_host_request_locked(Impl::PendingReq::Kind::HostR,
+                                        addr,
+                                        cmd,
+                                        UBX_DATA_CLASS_HOST_POLL_R,
+                                        fr,
+                                        sizeof(fr),
+                                        cmd,
+                                        err);
 }
 
 Status ShieldComm::send_host_poll_smg(const uint8_t* frame, size_t len, std::string* err) {
@@ -748,16 +845,145 @@ Status ShieldComm::send_host_poll_smg(const uint8_t* frame, size_t len, std::str
         addr = frame[0];
         cmd  = frame[1];
     }
+    std::lock_guard<std::mutex> req_lk(p_->req_mtx);
+    return p_->send_host_request_locked(Impl::PendingReq::Kind::HostSMG,
+                                        addr,
+                                        cmd,
+                                        UBX_DATA_CLASS_HOST_POLL_SMG,
+                                        frame,
+                                        len,
+                                        ubx_id_from_frame(frame, len),
+                                        err);
+}
 
-    // NEW pending
-    p_->set_pending(Impl::PendingReq::Kind::HostSMG, addr, cmd);
-
-    Status st = p_->send_ubx_data(UBX_DATA_CLASS_HOST_POLL_SMG, frame, len, ubx_id_from_frame(frame, len), err);
-    if (st != Status::Ok) {
-        std::lock_guard<std::mutex> lk(p_->pending_mtx);
-        p_->pending = Impl::PendingReq{};
+Status ShieldComm::send_host_general_poll_wait(uint8_t addr_with_wakeup,
+                                               int timeout_ms,
+                                               SasEvent* out_reply,
+                                               std::string* err) {
+    if (timeout_ms < 0) {
+        if (err) *err = "Negative timeout is not allowed";
+        return Status::InvalidArg;
     }
-    return st;
+    const auto timeout = std::chrono::milliseconds(timeout_ms);
+
+    uint8_t b = addr_with_wakeup;
+    uint64_t seq = 0;
+    std::unique_lock<std::mutex> req_lk(p_->req_mtx);
+    seq = p_->next_pending_seq();
+    if (!p_->begin_wait(seq, err)) {
+        return Status::InvalidArg;
+    }
+    Status st = p_->send_host_request_locked(Impl::PendingReq::Kind::HostGP,
+                                             static_cast<uint8_t>(addr_with_wakeup & 0x7Fu),
+                                             0,
+                                             UBX_DATA_CLASS_HOST_GENERAL_POLL,
+                                             &b,
+                                             1,
+                                             UBX_DATA_ID_RAW,
+                                             err);
+    if (st != Status::Ok) {
+        p_->cancel_wait(seq);
+        return st;
+    }
+
+    Impl::WaitOutcome outcome = p_->wait_for_reply(seq, timeout, out_reply);
+    p_->clear_pending(seq);
+    if (outcome == Impl::WaitOutcome::Event) return Status::Ok;
+    if (outcome == Impl::WaitOutcome::Timeout) {
+        if (err) *err = "Timeout waiting for reply";
+        return Status::Timeout;
+    }
+    if (err) *err = "Port closed while waiting for reply";
+    return Status::IoError;
+}
+
+Status ShieldComm::send_host_poll_r_wait(uint8_t addr,
+                                         uint8_t cmd,
+                                         int timeout_ms,
+                                         SasEvent* out_reply,
+                                         std::string* err) {
+    if (timeout_ms < 0) {
+        if (err) *err = "Negative timeout is not allowed";
+        return Status::InvalidArg;
+    }
+    const auto timeout = std::chrono::milliseconds(timeout_ms);
+
+    uint8_t fr[2] = { addr, cmd };
+    uint64_t seq = 0;
+    std::unique_lock<std::mutex> req_lk(p_->req_mtx);
+    seq = p_->next_pending_seq();
+    if (!p_->begin_wait(seq, err)) {
+        return Status::InvalidArg;
+    }
+    Status st = p_->send_host_request_locked(Impl::PendingReq::Kind::HostR,
+                                             addr,
+                                             cmd,
+                                             UBX_DATA_CLASS_HOST_POLL_R,
+                                             fr,
+                                             sizeof(fr),
+                                             cmd,
+                                             err);
+    if (st != Status::Ok) {
+        p_->cancel_wait(seq);
+        return st;
+    }
+
+    Impl::WaitOutcome outcome = p_->wait_for_reply(seq, timeout, out_reply);
+    p_->clear_pending(seq);
+    if (outcome == Impl::WaitOutcome::Event) return Status::Ok;
+    if (outcome == Impl::WaitOutcome::Timeout) {
+        if (err) *err = "Timeout waiting for reply";
+        return Status::Timeout;
+    }
+    if (err) *err = "Port closed while waiting for reply";
+    return Status::IoError;
+}
+
+Status ShieldComm::send_host_poll_smg_wait(const uint8_t* frame,
+                                           size_t len,
+                                           int timeout_ms,
+                                           SasEvent* out_reply,
+                                           std::string* err) {
+    if (timeout_ms < 0) {
+        if (err) *err = "Negative timeout is not allowed";
+        return Status::InvalidArg;
+    }
+    const auto timeout = std::chrono::milliseconds(timeout_ms);
+
+    uint8_t addr = 0;
+    uint8_t cmd = 0;
+    if (frame && len >= 2) {
+        addr = frame[0];
+        cmd = frame[1];
+    }
+    uint64_t seq = 0;
+    std::unique_lock<std::mutex> req_lk(p_->req_mtx);
+    seq = p_->next_pending_seq();
+    if (!p_->begin_wait(seq, err)) {
+        return Status::InvalidArg;
+    }
+    Status st = p_->send_host_request_locked(Impl::PendingReq::Kind::HostSMG,
+                                             addr,
+                                             cmd,
+                                             UBX_DATA_CLASS_HOST_POLL_SMG,
+                                             frame,
+                                             len,
+                                             ubx_id_from_frame(frame, len),
+                                             err);
+    if (st != Status::Ok) {
+        p_->cancel_wait(seq);
+        return st;
+    }
+
+    Impl::WaitOutcome outcome = p_->wait_for_reply(seq, timeout, out_reply);
+    p_->clear_pending(seq);
+    if (outcome == Impl::WaitOutcome::Event) return Status::Ok;
+    if (outcome == Impl::WaitOutcome::Timeout) {
+        if (err) *err = "Timeout waiting for reply";
+        return Status::Timeout;
+    }
+    if (err) *err = "Port closed while waiting for reply";
+    return Status::IoError;
 }
 
 

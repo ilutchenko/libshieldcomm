@@ -18,6 +18,7 @@ enum class Status {
     Ok = 0,
     NotOpen,
     IoError,
+    Timeout,
     InvalidArg,
 };
 
@@ -84,6 +85,28 @@ public:
     Status send_host_poll_smg(const uint8_t* frame, size_t len, std::string* err = nullptr);
     Status send_host_poll_smg(const std::vector<uint8_t>& frame, std::string* err = nullptr) {
         return send_host_poll_smg(frame.data(), frame.size(), err);
+    }
+
+    // Blocking variants: send request and wait for a matched reply or timeout.
+    Status send_host_general_poll_wait(uint8_t addr_with_wakeup,
+                                       int timeout_ms,
+                                       SasEvent* out_reply,
+                                       std::string* err = nullptr);
+    Status send_host_poll_r_wait(uint8_t addr,
+                                 uint8_t cmd,
+                                 int timeout_ms,
+                                 SasEvent* out_reply,
+                                 std::string* err = nullptr);
+    Status send_host_poll_smg_wait(const uint8_t* frame,
+                                   size_t len,
+                                   int timeout_ms,
+                                   SasEvent* out_reply,
+                                   std::string* err = nullptr);
+    Status send_host_poll_smg_wait(const std::vector<uint8_t>& frame,
+                                   int timeout_ms,
+                                   SasEvent* out_reply,
+                                   std::string* err = nullptr) {
+        return send_host_poll_smg_wait(frame.data(), frame.size(), timeout_ms, out_reply, err);
     }
 
     // EGM -> Host (useful for simulation/injection/testing)
