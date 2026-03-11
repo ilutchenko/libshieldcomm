@@ -105,6 +105,33 @@ static SasEventType ubx_cls_to_sas_evt(uint8_t cls) {
     }
 }
 
+static bool sas_cmd_uses_ack_reply(uint8_t cmd) {
+    // Appendix B: these long polls complete with a 1-byte ACK/NACK response.
+    switch (cmd) {
+        case 0x01:
+        case 0x02:
+        case 0x03:
+        case 0x04:
+        case 0x05:
+        case 0x06:
+        case 0x07:
+        case 0x08:
+        case 0x09:
+        case 0x0A:
+        case 0x0B:
+        case 0x0E:
+        case 0x2E:
+        case 0x75:
+        case 0x8A:
+        case 0x8B:
+        case 0x8C:
+        case 0xAA:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct ShieldComm::Impl {
     int fd = -1;
     Options opt{};
@@ -349,15 +376,16 @@ struct ShieldComm::Impl {
                     ok = true;
                 }
 
-                // Optional: some firmwares may answer NACK/ACK/BUSY at addr level
-                if (!ok && (ev.type == SasEventType::SAS_EVT_ACK ||
-                            ev.type == SasEventType::SAS_EVT_NACK ||
-                            ev.type == SasEventType::SAS_EVT_BUSY)) {
+                // Type R replies are command-coded responses. Ignore bare ACK/NACK and
+                // keep waiting for data; BUSY is still surfaced as a deferral signal.
+                if (!ok && ev.type == SasEventType::SAS_EVT_BUSY) {
                     if (addr_from_payload0() == p.addr) ok = true;
                 }
             } break;
 
             case PendingReq::Kind::HostSMG: {
+                const bool ack_is_final = sas_cmd_uses_ack_reply(p.cmd);
+
                 // If response carries data: EGM_RESP cmd matches
                 if (ev.type == SasEventType::SAS_EVT_EGM_RESP &&
                     (ev.ubx_id == p.cmd || ev.ubx_id == 0xFFu) &&
@@ -370,10 +398,17 @@ struct ShieldComm::Impl {
                     addr_from_payload0() == p.addr) {
                     ok = true;
                 }
-                // If response is just ACK/NACK/BUSY: match addr
-                if (!ok && (ev.type == SasEventType::SAS_EVT_ACK ||
-                            ev.type == SasEventType::SAS_EVT_NACK ||
-                            ev.type == SasEventType::SAS_EVT_BUSY)) {
+                // Appendix B distinguishes ACK/NACK-only commands from commands that
+                // return a full response frame with the command id.
+                if (!ok && ev.type == SasEventType::SAS_EVT_ACK &&
+                    ack_is_final && addr_from_payload0() == p.addr) {
+                    ok = true;
+                }
+                if (!ok && ev.type == SasEventType::SAS_EVT_NACK &&
+                    ack_is_final && addr_from_payload0() == p.addr) {
+                    ok = true;
+                }
+                if (!ok && ev.type == SasEventType::SAS_EVT_BUSY) {
                     if (addr_from_payload0() == p.addr) ok = true;
                 }
             } break;
